@@ -5,7 +5,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -414,21 +417,46 @@ func (m *Mega) api_request(r []byte) (buf []byte, err error) {
 	}()
 
 	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
-
 	if m.sid != "" {
 		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
 	}
 
 	sleepTime := minSleepTime // inital backoff time
+	hashCash := ""
 	for i := 0; i < m.retries+1; i++ {
 		if i != 0 {
 			m.debugf("Retry API request %d/%d: %v", i, m.retries, err)
 			backOffSleep(&sleepTime)
 		}
-		resp, err = m.client.Post(url, "application/json", bytes.NewBuffer(r))
+
+		var req *http.Request
+		req, err = http.NewRequest("POST", url, bytes.NewBuffer(r))
+		if err != nil {
+			m.logf("Error creating request: %v", err)
+			break
+		}
+
+		if hashCash != "" {
+			req.Header.Set("X-Hashcash", hashCash)
+		}
+		resp, err = m.client.Do(req)
 		if err != nil {
 			continue
 		}
+		if resp.StatusCode == 402 {
+			m.logf("login status: %s, starting get hashcash", resp.Status)
+			originCash := resp.Header.Get("X-Hashcash")
+			hashCash, err = handleHashcash(originCash)
+			_ = resp.Body.Close()
+			if err != nil {
+				m.logf("Error getting hashcash response: %v", err)
+				continue
+			}
+			m.debugf("originCash: %s, newCash: %s", originCash, hashCash)
+			err = errors.New("Http Status: " + resp.Status)
+			continue
+		}
+
 		if resp.StatusCode != 200 {
 			// err must be not-nil on a continue
 			err = errors.New("Http Status: " + resp.Status)
@@ -473,6 +501,106 @@ func (m *Mega) api_request(r []byte) (buf []byte, err error) {
 	}
 
 	return nil, err
+}
+
+func handleHashcash(cash string) (string, error) {
+	parts := strings.Split(cash, ":")
+	if len(parts) != 4 {
+		return "", fmt.Errorf("invalid 402 response, unexpected number of elements %v", parts)
+	}
+
+	x := 0
+	_, err := fmt.Sscanf(parts[0], "%d", &x)
+	if err != nil {
+		return "", fmt.Errorf("invalid 402 response, x parse error: %v", err)
+	}
+
+	y, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("invalid 402 response, y parse error: %v", err)
+	}
+
+	if x != 1 || y < 0 || y >= 256 {
+		return "", fmt.Errorf("invalid 402 response, mismatch %v", parts)
+	}
+
+	// 生成新的Hashcash
+	genCash, err := gencash(parts[3], uint32(y))
+	if err != nil {
+		return "", fmt.Errorf("gencash error: %v", err)
+	}
+	return "1:" + parts[3] + ":" + genCash, nil
+}
+
+// strToAB converts a string to a byte slice (equivalent to ArrayBuffer)
+// The JavaScript version pads to 16-byte boundaries, so we replicate that here
+func strToAB(b []byte) []byte {
+	// Calculate padded length (next multiple of 16)
+	paddedLength := (len(b) + 15) & -16
+
+	// Create byte slice with padded length
+	ab := make([]byte, paddedLength)
+
+	copy(ab, b)
+	return ab
+}
+
+// base64ToAB decodes a base64 URL-encoded string to a byte slice
+func base64ToAB(a string) ([]byte, error) {
+	// Decode base64 URL-encoded string
+	decoded, err := base64.RawURLEncoding.DecodeString(a)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to ArrayBuffer equivalent (byte slice)
+	return strToAB(decoded), nil
+}
+
+// abToBase64 converts an ArrayBuffer (represented as a byte slice in Go) to a base64 URL-encoded string
+func abToBase64(ab []byte) string {
+	return base64.RawStdEncoding.EncodeToString(ab)
+}
+
+func gencash(token string, easiness uint32) (string, error) {
+	// Initialize buffer
+	buffer := make([]byte, 4+262144*48)
+
+	// Calculate threshold
+	var threshold = (((easiness & 63) << 1) + 1) << ((easiness>>6)*7 + 3)
+
+	// Decode token if it's a base64 string
+	tokenBytes, err := base64ToAB(token)
+	if err != nil {
+		return "", err
+	}
+
+	// Fill buffer with token data
+	for i := 0; i < 262144; i++ {
+		copy(buffer[4+i*48:], tokenBytes)
+	}
+
+	round := func() string {
+		for {
+			// Increment prefix
+			for j := 0; ; j++ {
+				buffer[j]++
+				if buffer[j] != 0 {
+					break
+				}
+			}
+
+			prefix := buffer[:4]
+			// Calculate SHA-256 hash
+			hash := sha256.Sum256(buffer)
+			// Check threshold (using first 4 bytes as uint32 in little-endian)
+			var hashVal = uint32(hash[0])<<24 | uint32(hash[1])<<16 | uint32(hash[2])<<8 | uint32(hash[3])
+			if hashVal <= threshold {
+				return abToBase64(prefix)
+			}
+		}
+	}
+	return round(), nil
 }
 
 // prelogin call

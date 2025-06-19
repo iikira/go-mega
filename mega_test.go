@@ -412,3 +412,13 @@ func TestWaitEvents(t *testing.T) {
 	// Check nothing happens if we fire the event with no listeners
 	m.waitEventsFire()
 }
+
+func TestHashCash(t *testing.T) {
+	hashcash, err := handleHashcash("1:193:1750266040:lT7bJh0I6PMXN3LNe8NAIqnMeomIVy1Nn--t9hk0r8kbdviR607YI72W3-193Q1Q")
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	if hashcash != "1:lT7bJh0I6PMXN3LNe8NAIqnMeomIVy1Nn--t9hk0r8kbdviR607YI72W3-193Q1Q:0QAAAA" {
+		t.Errorf("Unexpected hash cash: %v", hashcash)
+	}
+}
